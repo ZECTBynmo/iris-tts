@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data directories
+data/LJSpeech-1.1/
+data/LJSpeech-1.1.tar.bz2
+data/ljspeech_alignments/
+data/ljspeech_corpus/
+data/ljspeech_texts/
+
+# Model checkpoints and outputs
+outputs/
+checkpoints/
+*.weights.h5
+*.keras
+*.ckpt
+*.pt
+*.pth
+
+# Cached files
+*.npy
+*.npz
+.cache/
+cache/
+
+# Logs
+*.log
+logs/
+tensorboard/
+wandb/
+
+# Audio files (optional - uncomment if you don't want to track generated audio)
+# *.wav
+# *.mp3
+# *.flac
+
+# MFA models (downloaded by Montreal Forced Aligner)
+models/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS specific
+.DS_Store
+Thumbs.db
