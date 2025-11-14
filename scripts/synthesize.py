@@ -122,7 +122,7 @@ def main():
     _ = encoder(jnp.ones((1, 8), dtype="int32"), training=False)
     logger.info(f"Loading encoder weights: {Path(args.encoder_weights).resolve()}")
     encoder.load_weights(args.encoder_weights)
-    duration_head = DurationPredictor(hidden_dim=args.embed_dim, dropout=0.5)
+    duration_head = DurationPredictor(hidden_dim=args.embed_dim, dropout=0.1)
     # Build duration head with dummy
     _ = duration_head(jnp.ones((1, 8, args.embed_dim), dtype="float32"), training=False)
     if Path(args.duration_weights).exists():

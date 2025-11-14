@@ -189,7 +189,7 @@ def test_trained_encoder():
     
     duration_predictor = DurationPredictor(
         hidden_dim=256,
-        dropout=0.5
+        dropout=0.1
     )
     
     # Build with dummy input

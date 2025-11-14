@@ -237,7 +237,7 @@ class DurationPredictor(keras.Model):
         hidden_dim: int = 256,
         num_layers: int = 2,
         kernel_size: int = 3,
-        dropout: float = 0.5,
+        dropout: float = 0.1,
         **kwargs
     ):
         """
@@ -307,9 +307,10 @@ class DurationPredictor(keras.Model):
         # Output projection (log-space durations)
         x = self.output_proj(x)  # [batch, seq_len, 1]
         
-        # Apply ReLU to keep outputs positive (since we're in log-space)
-        # Add small offset to avoid log(1) = 0, which would mean duration of 0 frames
-        x = ops.relu(x) + 0.1  # Minimum value = 0.1 ≈ log(1.1) ≈ 1 frame min
+        # Apply softplus to keep outputs positive and smooth
+        # softplus(x) = log(1 + exp(x)), always positive with smooth gradients
+        # Ranges from ~0 to infinity smoothly
+        x = ops.softplus(x)
         
         return x
     
@@ -436,31 +437,47 @@ def create_padding_mask(lengths: jnp.ndarray, max_len: int) -> jnp.ndarray:
 @jax.jit
 def compute_duration_loss(predicted_log_durations: jnp.ndarray, 
                           target_durations: jnp.ndarray,
-                          mask: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+                          mask: Optional[jnp.ndarray] = None,
+                          delta: float = 10.0) -> jnp.ndarray:
     """
-    Compute MSE loss for duration prediction (JIT-compiled).
+    Compute duration loss using Huber loss in linear space.
+    
+    Huber loss is MSE for small errors, MAE for large errors.
+    This prevents gradient explosion from outliers while still
+    penalizing uniform predictions more than log-space MSE.
     
     Args:
         predicted_log_durations: Predicted log-durations [batch, seq_len, 1]
         target_durations: Ground truth durations [batch, seq_len]
         mask: Optional mask for valid positions [batch, seq_len]
+        delta: Threshold for switching from MSE to MAE (frames)
         
     Returns:
         Scalar loss value
     """
-    # Convert target to log-space (add 1 to avoid log(0))
-    target_log_durations = jnp.log(target_durations + 1.0)
-    target_log_durations = target_log_durations[..., None]  # [batch, seq_len, 1]
+    # Convert predictions back to linear space
+    # predicted_log_durations are log(duration+1), so invert:
+    predicted_durations = jnp.exp(predicted_log_durations) - 1.0  # [batch, seq_len, 1]
+    predicted_durations = predicted_durations[..., 0]  # [batch, seq_len]
     
-    # MSE loss
-    squared_diff = jnp.square(predicted_log_durations - target_log_durations)
+    # Huber loss: smooth L1 loss
+    # For |error| < delta: 0.5 * error^2
+    # For |error| >= delta: delta * (|error| - 0.5 * delta)
+    diff = predicted_durations - target_durations
+    abs_diff = jnp.abs(diff)
+    
+    # Quadratic for small errors, linear for large
+    huber = jnp.where(
+        abs_diff <= delta,
+        0.5 * jnp.square(diff),
+        delta * (abs_diff - 0.5 * delta)
+    )
     
     # Apply mask if provided
     if mask is not None:
-        mask = mask[..., None]  # [batch, seq_len, 1]
-        squared_diff = squared_diff * mask
-        loss = jnp.sum(squared_diff) / jnp.sum(mask)
+        huber = huber * mask
+        loss = jnp.sum(huber) / (jnp.sum(mask) + 1e-8)
     else:
-        loss = jnp.mean(squared_diff)
+        loss = jnp.mean(huber)
     
     return loss

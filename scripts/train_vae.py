@@ -158,6 +158,7 @@ def train_vae(
 		alignments_dir=alignments_dir,
 		split="train",
 		val_split=val_split,
+		cache_dir=str(output_dir / "cache"),
 	)
 	val_dataset = LJSpeechVAEDataset(
 		ljspeech_dir=ljspeech_dir,

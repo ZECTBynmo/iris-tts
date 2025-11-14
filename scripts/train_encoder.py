@@ -144,7 +144,7 @@ def train_encoder(
     
     duration_predictor = DurationPredictor(
         hidden_dim=embed_dim,
-        dropout=0.5
+        dropout=0.1
     )
     
     # Build combined model

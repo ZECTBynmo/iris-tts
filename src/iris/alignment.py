@@ -150,12 +150,13 @@ class MFAAligner:
                 tg = TextGrid.fromFile(str(textgrid_file))
                 name = textgrid_file.stem
                 
-                # Extract phone-level alignments from the tier
+                # Extract phone-level alignments from the phones tier
+                # MFA creates two tiers: tiers[0] = words, tiers[1] = phones
                 phones = []
-                if len(tg.tiers) > 0:
-                    phone_tier = tg.tiers[0]
+                if len(tg.tiers) > 1:
+                    phone_tier = tg.tiers[1]  # Use phones tier, not words tier
                     for interval in phone_tier:
-                        if interval.mark:  # Skip silence
+                        if interval.mark and interval.mark.strip():  # Skip empty/silence
                             phones.append({
                                 "phone": interval.mark,
                                 "start": interval.minTime,
