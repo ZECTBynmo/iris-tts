@@ -21,6 +21,8 @@ dependencies = [
     "sacremoses>=0.1.0",
     "wget>=3.2",
     "textgrid>=1.5.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
 ]
 
 [build-system]

@@ -138,50 +138,77 @@ for filename, phones in alignments.items():
         print(f"{phone['phone']}: {phone['start']:.3f}s - {phone['end']:.3f}s")
 ```
 
-### HiFiGAN Vocoder (Keras/JAX)
+### HiFiGAN Vocoder
 
-HiFiGAN is a high-quality neural vocoder that converts mel-spectrograms to audio waveforms. Our implementation uses **Keras with JAX backend** - no PyTorch needed!
+HiFiGAN is a high-quality neural vocoder that converts mel-spectrograms to audio waveforms. This project includes:
+1. **Pre-trained PyTorch HiFiGAN** (recommended) - High quality, ready to use
+2. **Keras/JAX implementation** - For training or custom architectures
 
-#### Quick Demo
+#### Using Pre-trained HiFiGAN (Recommended)
+
+The pre-trained HiFiGAN model from speechbrain is already downloaded and ready to use. No training required!
+
+**In the TTS Pipeline:**
+
+```bash
+# Synthesize speech using the pre-trained HiFiGAN vocoder
+uv run python scripts/synthesize.py \
+  --text "Hello world, this is a test." \
+  --vocoder hifigan \
+  --vocoder_entry iris.hifigan_pretrained:infer_hifigan
+```
+
+**In Your Python Code:**
+
+```python
+from iris.hifigan_pretrained import infer_hifigan, get_pretrained_hifigan
+import numpy as np
+import soundfile as sf
+
+# Option 1: Direct inference (singleton pattern, efficient)
+mel = your_tts_model.synthesize("Hello")  # Shape: [n_mels, time] or [batch, n_mels, time]
+audio = infer_hifigan(mel)                 # Returns: [samples]
+sf.write("output.wav", audio, 22050)
+
+# Option 2: Get vocoder instance for multiple calls
+vocoder = get_pretrained_hifigan()
+audio = vocoder(mel)
+```
+
+**Quick Test:**
+
+```bash
+# Test the HiFiGAN integration
+uv run python test_hifigan_integration.py
+```
+
+#### Keras/JAX HiFiGAN (For Training)
+
+If you want to train your own HiFiGAN model:
 
 ```bash
 # Run the HiFiGAN architecture demo
 uv run python demo_vocoder.py
 ```
 
-This will:
-1. Initialize HiFiGAN model in Keras/JAX
-2. Extract mel-spectrogram from a sample LJSpeech audio
-3. Generate audio using HiFiGAN architecture
-4. Show model summary and usage examples
-
-**Note:** The demo uses random weights. For production use, you need to train the model on your dataset.
-
-#### Using HiFiGAN in Your Code
-
 ```python
 from iris.vocoder import create_vocoder
 import numpy as np
 import soundfile as sf
 
-# Initialize vocoder
+# Initialize vocoder (random weights)
+vocoder = create_vocoder()
+
+# Train the model...
+# vocoder.model.fit(...)
+
+# Save weights
+vocoder.save_weights("models/hifigan_weights.keras")
+
+# Load and use
 vocoder = create_vocoder(weights_path="models/hifigan_weights.keras")
-
-# Generate audio from mel-spectrogram
-mel = your_tts_model.synthesize("Hello")  # Shape: [80, time]
-audio = vocoder.infer(mel)                # Returns: [samples]
-
-# Save audio
-sf.write("output.wav", audio, 22050)
+audio = vocoder.infer(mel)
 ```
-
-#### Training HiFiGAN
-
-To train HiFiGAN on your dataset:
-1. Prepare paired (mel-spectrogram, audio) data from LJSpeech
-2. Train the generator model
-3. Save weights: `vocoder.save_weights("hifigan_weights.keras")`
-4. Use trained weights for inference
 
 ## Development
 

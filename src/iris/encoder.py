@@ -307,6 +307,10 @@ class DurationPredictor(keras.Model):
         # Output projection (log-space durations)
         x = self.output_proj(x)  # [batch, seq_len, 1]
         
+        # Apply ReLU to keep outputs positive (since we're in log-space)
+        # Add small offset to avoid log(1) = 0, which would mean duration of 0 frames
+        x = ops.relu(x) + 0.1  # Minimum value = 0.1 ≈ log(1.1) ≈ 1 frame min
+        
         return x
     
     def get_config(self):

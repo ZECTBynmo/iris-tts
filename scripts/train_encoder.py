@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import json
 import numpy as np
+from tqdm import tqdm
 
 import keras
 from keras import ops
@@ -61,6 +62,8 @@ def train_encoder(
     batch_size: int = 32,
     num_epochs: int = 50,
     learning_rate: float = 1e-4,
+    warmup_epochs: int = 5,
+    min_learning_rate: float = 1e-6,
     val_split: float = 0.05,
     checkpoint_dir: str = "checkpoints",
     log_interval: int = 100,
@@ -96,6 +99,8 @@ def train_encoder(
         'batch_size': batch_size,
         'num_epochs': num_epochs,
         'learning_rate': learning_rate,
+        'warmup_epochs': warmup_epochs,
+        'min_learning_rate': min_learning_rate,
         'val_split': val_split,
     }
     
@@ -153,14 +158,31 @@ def train_encoder(
     logger.info(f"Duration predictor parameters: {duration_predictor.count_params():,}")
     logger.info(f"Total parameters: {combined_model.count_params():,}")
     
+    # Create learning rate schedule with warmup + cosine decay
+    def compute_learning_rate(epoch):
+        """Warmup + cosine decay schedule."""
+        if epoch < warmup_epochs:
+            # Linear warmup
+            return learning_rate * (epoch + 1) / warmup_epochs
+        else:
+            # Cosine decay after warmup
+            progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
+            cosine_decay = 0.5 * (1 + np.cos(np.pi * progress))
+            return min_learning_rate + (learning_rate - min_learning_rate) * cosine_decay
+    
+    # Create optimizer with initial learning rate
+    optimizer = keras.optimizers.Adam(learning_rate=compute_learning_rate(0))
+    
     # Compile model
     combined_model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        optimizer=optimizer,
         loss=combined_model.compute_loss,
         jit_compile=True  # Enable XLA compilation
     )
     
     logger.info("Model compiled with JIT compilation enabled")
+    logger.info(f"Learning rate schedule: warmup for {warmup_epochs} epochs, then cosine decay")
+    logger.info(f"LR range: {compute_learning_rate(0):.2e} -> {learning_rate:.2e} -> {min_learning_rate:.2e}")
     
     # Training loop
     logger.info("Starting training...")
@@ -168,7 +190,11 @@ def train_encoder(
     global_step = 0
     
     for epoch in range(num_epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
+        # Update learning rate for this epoch
+        current_lr = compute_learning_rate(epoch)
+        optimizer.learning_rate.assign(current_lr)
+        
+        logger.info(f"\nEpoch {epoch + 1}/{num_epochs} | LR: {current_lr:.2e}")
         
         # Training
         epoch_losses = []
@@ -177,7 +203,8 @@ def train_encoder(
         # Shuffle training data
         train_indices = np.random.permutation(len(train_dataset))
         
-        for step in range(num_batches):
+        pbar = tqdm(range(num_batches), desc=f"train {epoch+1}/{num_epochs}")
+        for step in pbar:
             # Get batch
             start_idx = step * batch_size
             end_idx = min(start_idx + batch_size, len(train_dataset))
@@ -205,14 +232,9 @@ def train_encoder(
             epoch_losses.append(float(loss))
             global_step += 1
             
-            # Logging
-            if step % log_interval == 0:
-                avg_loss = np.mean(epoch_losses[-log_interval:])
-                logger.info(
-                    f"Step {global_step} ({step}/{num_batches}) | "
-                    f"Loss: {float(loss):.4f} | "
-                    f"Avg Loss: {avg_loss:.4f}"
-                )
+            # Update progress bar
+            avg_loss = np.mean(epoch_losses[-min(100, len(epoch_losses)):])
+            pbar.set_postfix(loss=f"{float(loss):.4f}", avg=f"{avg_loss:.4f}")
         
         train_loss = np.mean(epoch_losses)
         
@@ -220,7 +242,8 @@ def train_encoder(
         val_losses = []
         num_val_batches = int(np.ceil(len(val_dataset) / batch_size))
         
-        for step in range(num_val_batches):
+        pbar_val = tqdm(range(num_val_batches), desc=f"val   {epoch+1}/{num_epochs}")
+        for step in pbar_val:
             start_idx = step * batch_size
             end_idx = min(start_idx + batch_size, len(val_dataset))
             
@@ -244,6 +267,7 @@ def train_encoder(
             )
             
             val_losses.append(float(loss))
+            pbar_val.set_postfix(loss=f"{float(loss):.4f}")
         
         val_loss = np.mean(val_losses)
         
@@ -300,7 +324,9 @@ def main():
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=50)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Peak learning rate after warmup')
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Number of warmup epochs')
+    parser.add_argument('--min_learning_rate', type=float, default=1e-6, help='Minimum learning rate at end of training')
     parser.add_argument('--val_split', type=float, default=0.05)
     
     args = parser.parse_args()
@@ -315,6 +341,8 @@ def main():
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
+        warmup_epochs=args.warmup_epochs,
+        min_learning_rate=args.min_learning_rate,
         val_split=args.val_split,
     )
 

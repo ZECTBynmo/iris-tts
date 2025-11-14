@@ -63,10 +63,21 @@ def build_frame_level_condition(encoder_outputs, durations, mel_lengths):
 
 class VAETrainer(keras.Model):
 	"""Wraps VAE to define Keras losses for train_on_batch/test_on_batch."""
-	def __init__(self, vae: TextConditionedVAE, kl_weight: float = 1e-3, **kwargs):
+	def __init__(self, vae: TextConditionedVAE, kl_weight: float = 0.1, **kwargs):
 		super().__init__(**kwargs)
 		self.vae = vae
-		self.kl_weight = kl_weight
+		self._kl_weight = kl_weight
+	
+	def set_kl_weight(self, weight: float):
+		"""Update KL weight dynamically during training (for annealing)."""
+		self._kl_weight = weight
+	
+	def get_kl_weight(self) -> float:
+		return self._kl_weight
+	
+	@property
+	def kl_weight(self):
+		return self._kl_weight
 	
 	def call(self, inputs, training=False):
 		# inputs: (mels_bt_f, frame_text_cond, mask_bt)
@@ -82,7 +93,9 @@ class VAETrainer(keras.Model):
 		recon, (mean, logvar), _ = self.vae(mels_bt_f, frame_text_cond, training=True)
 		loss_recon = self.vae.compute_recon_l1(y, recon, mask=mask_bt)
 		loss_kl = self.vae.compute_kl(mean, logvar)
-		return loss_recon + self.kl_weight * loss_kl
+		# Note: Can't store losses here for logging because this runs in JIT context
+		# Will log total loss only
+		return loss_recon + self._kl_weight * loss_kl
 
 
 def train_vae(
@@ -104,7 +117,9 @@ def train_vae(
 	val_split: float = 0.05,
 	checkpoint_dir: str = "checkpoints_vae",
 	log_interval: int = 100,
-	kl_weight: float = 1e-3,
+	kl_weight: float = 0.1,
+	kl_anneal_start: float = 0.01,
+	kl_anneal_epochs: int = 10,
 ):
 	output_dir = Path(output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
@@ -129,6 +144,8 @@ def train_vae(
 		"freeze_encoder": freeze_encoder,
 		"encoder_weights": encoder_weights,
 		"kl_weight": kl_weight,
+		"kl_anneal_start": kl_anneal_start,
+		"kl_anneal_epochs": kl_anneal_epochs,
 	}
 	with open(output_dir / "config_vae.json", "w") as f:
 		json.dump(config, f, indent=2)
@@ -197,14 +214,23 @@ def train_vae(
 	
 	logger.info(f"VAE parameters: {vae.count_params():,}")
 
-	# Training wrapper
-	model = VAETrainer(vae=vae, kl_weight=kl_weight)
+	# Training wrapper - start with annealed KL weight
+	model = VAETrainer(vae=vae, kl_weight=kl_anneal_start)
 	model.compile(
 		optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
 		loss=model.compute_loss,
 		jit_compile=True,
 	)
 	logger.info("Compiled VAE trainer with JIT.")
+	logger.info(f"KL annealing: {kl_anneal_start:.4f} -> {kl_weight:.4f} over {kl_anneal_epochs} epochs")
+	
+	def compute_kl_weight_for_epoch(epoch_num):
+		"""Linear KL annealing schedule."""
+		if epoch_num >= kl_anneal_epochs:
+			return kl_weight
+		# Linear interpolation from kl_anneal_start to kl_weight
+		progress = epoch_num / kl_anneal_epochs
+		return kl_anneal_start + (kl_weight - kl_anneal_start) * progress
 	
 	def iterate_batches(dataset, bs):
 		num_batches = int(np.ceil(len(dataset) / bs))
@@ -217,7 +243,10 @@ def train_vae(
 	global_step = 0
 	
 	for epoch in range(num_epochs):
-		logger.info(f"\nEpoch {epoch+1}/{num_epochs}")
+		# Update KL weight for this epoch
+		current_kl_weight = compute_kl_weight_for_epoch(epoch)
+		model.set_kl_weight(current_kl_weight)
+		logger.info(f"\nEpoch {epoch+1}/{num_epochs} | KL weight: {current_kl_weight:.4f}")
 		train_losses = []
 		
 		# Shuffle
@@ -326,7 +355,11 @@ def train_vae(
 			pbar_val.set_postfix(loss=f"{float(loss):.4f}")
 		
 		val_loss = float(np.mean(val_losses)) if val_losses else 0.0
-		logger.info(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+		# Log epoch summary
+		logger.info(
+			f"Epoch {epoch+1} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | "
+			f"KL_weight: {current_kl_weight:.4f}"
+		)
 		
 		# Checkpoint
 		if val_loss < best_val:
@@ -363,7 +396,9 @@ def main():
 	parser.add_argument("--num_epochs", type=int, default=50)
 	parser.add_argument("--learning_rate", type=float, default=2e-4)
 	parser.add_argument("--val_split", type=float, default=0.05)
-	parser.add_argument("--kl_weight", type=float, default=1e-3)
+	parser.add_argument("--kl_weight", type=float, default=0.1, help="Target KL divergence weight after annealing")
+	parser.add_argument("--kl_anneal_start", type=float, default=0.01, help="Initial KL weight at start of training")
+	parser.add_argument("--kl_anneal_epochs", type=int, default=10, help="Number of epochs to anneal KL weight from start to target")
 	parser.add_argument("--log_interval", type=int, default=100)
 	args = parser.parse_args()
 	
@@ -386,6 +421,8 @@ def main():
 		val_split=args.val_split,
 		log_interval=args.log_interval,
 		kl_weight=args.kl_weight,
+		kl_anneal_start=args.kl_anneal_start,
+		kl_anneal_epochs=args.kl_anneal_epochs,
 	)
 
 

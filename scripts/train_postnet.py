@@ -11,6 +11,8 @@ import numpy as np
 from tqdm import tqdm
 
 import keras
+from keras import ops
+from keras.optimizers.schedules import CosineDecay, ExponentialDecay
 import jax.numpy as jnp
 
 from iris.encoder import PhonemeEncoder
@@ -89,6 +91,15 @@ def train_postnet(
 	postnet_layers: int = 5,
 	postnet_channels: int = 512,
 	postnet_dropout: float = 0.5,
+	optimizer_name: str = "adam",
+	momentum: float = 0.9,
+	nesterov: bool = False,
+	lr_schedule: str = "cosine",  # none|cosine|exp
+	warmup_steps: int = 0,
+	decay_alpha: float = 0.1,  # cosine final lr fraction
+	decay_rate: float = 0.96,  # exp decay factor
+	in_memory_cache: bool = False,
+	target_len: int = 1024,
 ):
 	output_dir = Path(output_dir)
 	ckpt_dir = output_dir / "checkpoints_postnet"
@@ -168,6 +179,46 @@ def train_postnet(
 	vae.load_weights(vae_core_weights)
 	if freeze_vae:
 		vae.trainable = False
+
+	# Optional in-memory cache (mel, frame_cond, mask), padded to fixed target_len
+	cache_train = None
+	cache_val = None
+	if in_memory_cache:
+		logger.info("Precomputing in-memory cache for training and validation...")
+		factor = 2 ** down_stages
+		# Ensure target_len is a multiple of factor
+		if target_len % factor != 0:
+			target_len = int(np.ceil(target_len / factor) * factor)
+		def build_cache(dataset):
+			N = len(dataset)
+			mels = np.zeros((N, n_mels, target_len), dtype=np.float32)
+			conds = np.zeros((N, target_len, embed_dim), dtype=np.float32)
+			masks = np.zeros((N, target_len), dtype=bool)
+			pbar = tqdm(range(N), desc="caching")
+			for i in pbar:
+				sample = dataset[i]
+				# Encoder conditioning
+				phoneme_ids = jnp.array(sample['phoneme_ids'][None, :])
+				enc_out = text_encoder(phoneme_ids, training=False)
+				enc_out_np = np.array(enc_out)  # [1, P, E]
+				frame_cond_np, mask_np = build_frame_level_condition(enc_out_np, sample['durations'][None, :], np.array([sample['mel_spec'].shape[1]]))
+				# Pad/truncate to target_len
+				fc = frame_cond_np[0]
+				mk = mask_np[0]
+				T = min(fc.shape[0], target_len)
+				conds[i, :T, :] = fc[:T]
+				masks[i, :T] = mk[:T]
+				# Mel
+				mel = sample['mel_spec']  # [n_mels, time]
+				TT = min(mel.shape[1], target_len)
+				mels[i, :, :TT] = mel[:, :TT]
+			return {
+				"mels": mels,
+				"conds": conds,
+				"masks": masks,
+			}
+		cache_train = build_cache(train_dataset)
+		cache_val = build_cache(val_dataset)
 	
 	# PostNet
 	logger.info("Building PostNet...")
@@ -182,8 +233,41 @@ def train_postnet(
 	
 	# Trainer
 	model = PostNetTrainer(vae=vae, postnet=postnet)
+
+	# Build LR schedule
+	num_train_batches = int(np.ceil(len(train_dataset) / batch_size))
+	total_steps = num_epochs * max(1, num_train_batches)
+	lr = learning_rate
+	if lr_schedule.lower() == "cosine":
+		base = CosineDecay(initial_learning_rate=learning_rate, decay_steps=total_steps, alpha=decay_alpha)
+		if warmup_steps > 0:
+			class WarmupThen(keras.optimizers.schedules.LearningRateSchedule):
+				def __init__(self, warmup_steps, peak_lr, base_sched):
+					self.warmup_steps = warmup_steps
+					self.peak_lr = peak_lr
+					self.base_sched = base_sched
+				def __call__(self, step):
+					step_f = ops.cast(step, "float32")
+					ws = ops.cast(self.warmup_steps, "float32")
+					warm = self.peak_lr * (step_f / ops.maximum(ws, 1.0))
+					decay = self.base_sched(step_f - ws)
+					return ops.where(step_f < ws, warm, decay)
+			lr = WarmupThen(warmup_steps, learning_rate, base)
+		else:
+			lr = base
+	elif lr_schedule.lower() == "exp":
+		decay_steps = max(1, total_steps // 10)
+		lr = ExponentialDecay(initial_learning_rate=learning_rate, decay_steps=decay_steps, decay_rate=decay_rate, staircase=True)
+
+	# Optimizer with optional momentum
+	opt_name = optimizer_name.lower()
+	if opt_name == "sgd":
+		optimizer = keras.optimizers.SGD(learning_rate=lr, momentum=momentum, nesterov=nesterov)
+	else:
+		optimizer = keras.optimizers.Adam(learning_rate=lr)
+
 	model.compile(
-		optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+		optimizer=optimizer,
 		loss=model.compute_loss,
 		jit_compile=True,
 	)
@@ -207,39 +291,38 @@ def train_postnet(
 		pbar = tqdm(range(0, len(train_dataset), batch_size), total=num_train_batches, desc=f"train {epoch+1}/{num_epochs}")
 		for step, idxs in enumerate(pbar):
 			batch_idxs = perm[idxs: idxs + batch_size]
-			batch = [train_dataset[int(i)] for i in batch_idxs]
-			col = collate_vae_batch(batch)
-			
-			phoneme_ids = jnp.array(col["phoneme_ids"])
-			mels_bt_f = jnp.array(col["mel_specs"])
-			durations = np.array(col["durations"])
-			mel_len = np.array(col["mel_lengths"])
-			
-			# Conditioning
-			enc_out = text_encoder(phoneme_ids, training=False)
-			enc_out_np = np.array(enc_out)
-			frame_cond_np, mask_np = build_frame_level_condition(enc_out_np, durations, mel_len)
-			
-			# Pad to factor
-			factor = 2 ** down_stages
-			t_max = frame_cond_np.shape[1]
-			target_len = int(np.ceil(t_max / factor) * factor)
-			mels_bt_f_np = np.array(mels_bt_f)
-			if mels_bt_f_np.shape[2] < target_len:
-				pad = np.zeros((mels_bt_f_np.shape[0], mels_bt_f_np.shape[1], target_len - mels_bt_f_np.shape[2]), dtype=mels_bt_f_np.dtype)
-				mels_bt_f_np = np.concatenate([mels_bt_f_np, pad], axis=2)
-			elif mels_bt_f_np.shape[2] > target_len:
-				mels_bt_f_np = mels_bt_f_np[:, :, :target_len]
-			if frame_cond_np.shape[1] < target_len:
-				pad = np.zeros((frame_cond_np.shape[0], target_len - frame_cond_np.shape[1], frame_cond_np.shape[2]), dtype=frame_cond_np.dtype)
-				frame_cond_np = np.concatenate([frame_cond_np, pad], axis=1)
-			if mask_np.shape[1] < target_len:
-				padm = np.zeros((mask_np.shape[0], target_len - mask_np.shape[1]), dtype=mask_np.dtype)
-				mask_np = np.concatenate([mask_np, padm], axis=1)
-			
-			frame_cond = jnp.array(frame_cond_np)
-			mask_bt = jnp.array(mask_np)
-			mels_bt_f = jnp.array(mels_bt_f_np)
+			if in_memory_cache:
+				mels_bt_f = jnp.array(cache_train["mels"][batch_idxs])
+				frame_cond = jnp.array(cache_train["conds"][batch_idxs])
+				mask_bt = jnp.array(cache_train["masks"][batch_idxs])
+			else:
+				batch = [train_dataset[int(i)] for i in batch_idxs]
+				col = collate_vae_batch(batch)
+				phoneme_ids = jnp.array(col["phoneme_ids"])
+				mels_bt_f = jnp.array(col["mel_specs"])
+				durations = np.array(col["durations"])
+				mel_len = np.array(col["mel_lengths"])
+				enc_out = text_encoder(phoneme_ids, training=False)
+				enc_out_np = np.array(enc_out)
+				frame_cond_np, mask_np = build_frame_level_condition(enc_out_np, durations, mel_len)
+				factor = 2 ** down_stages
+				t_max = frame_cond_np.shape[1]
+				T = int(np.ceil(t_max / factor) * factor)
+				mels_bt_f_np = np.array(mels_bt_f)
+				if mels_bt_f_np.shape[2] < T:
+					pad = np.zeros((mels_bt_f_np.shape[0], mels_bt_f_np.shape[1], T - mels_bt_f_np.shape[2]), dtype=mels_bt_f_np.dtype)
+					mels_bt_f_np = np.concatenate([mels_bt_f_np, pad], axis=2)
+				elif mels_bt_f_np.shape[2] > T:
+					mels_bt_f_np = mels_bt_f_np[:, :, :T]
+				if frame_cond_np.shape[1] < T:
+					pad = np.zeros((frame_cond_np.shape[0], T - frame_cond_np.shape[1], frame_cond_np.shape[2]), dtype=frame_cond_np.dtype)
+					frame_cond_np = np.concatenate([frame_cond_np, pad], axis=1)
+				if mask_np.shape[1] < T:
+					padm = np.zeros((mask_np.shape[0], T - mask_np.shape[1]), dtype=mask_np.dtype)
+					mask_np = np.concatenate([mask_np, padm], axis=1)
+				frame_cond = jnp.array(frame_cond_np)
+				mask_bt = jnp.array(mask_np)
+				mels_bt_f = jnp.array(mels_bt_f_np)
 			
 			# Train
 			loss = model.train_on_batch(
@@ -259,37 +342,39 @@ def train_postnet(
 		pbar_val = tqdm(range(0, len(val_dataset), batch_size), total=num_val_batches, desc=f"val   {epoch+1}/{num_epochs}")
 		for start in pbar_val:
 			end = min(start + batch_size, len(val_dataset))
-			batch = [val_dataset[i] for i in range(start, end)]
-			col = collate_vae_batch(batch)
-			
-			phoneme_ids = jnp.array(col["phoneme_ids"])
-			mels_bt_f = jnp.array(col["mel_specs"])
-			durations = np.array(col["durations"])
-			mel_len = np.array(col["mel_lengths"])
-			
-			enc_out = text_encoder(phoneme_ids, training=False)
-			enc_out_np = np.array(enc_out)
-			frame_cond_np, mask_np = build_frame_level_condition(enc_out_np, durations, mel_len)
-			
-			factor = 2 ** down_stages
-			t_max = frame_cond_np.shape[1]
-			target_len = int(np.ceil(t_max / factor) * factor)
-			mels_bt_f_np = np.array(mels_bt_f)
-			if mels_bt_f_np.shape[2] < target_len:
-				pad = np.zeros((mels_bt_f_np.shape[0], mels_bt_f_np.shape[1], target_len - mels_bt_f_np.shape[2]), dtype=mels_bt_f_np.dtype)
-				mels_bt_f_np = np.concatenate([mels_bt_f_np, pad], axis=2)
-			elif mels_bt_f_np.shape[2] > target_len:
-				mels_bt_f_np = mels_bt_f_np[:, :, :target_len]
-			if frame_cond_np.shape[1] < target_len:
-				pad = np.zeros((frame_cond_np.shape[0], target_len - frame_cond_np.shape[1], frame_cond_np.shape[2]), dtype=frame_cond_np.dtype)
-				frame_cond_np = np.concatenate([frame_cond_np, pad], axis=1)
-			if mask_np.shape[1] < target_len:
-				padm = np.zeros((mask_np.shape[0], target_len - mask_np.shape[1]), dtype=mask_np.dtype)
-				mask_np = np.concatenate([mask_np, padm], axis=1)
-			
-			frame_cond = jnp.array(frame_cond_np)
-			mask_bt = jnp.array(mask_np)
-			mels_bt_f = jnp.array(mels_bt_f_np)
+			if in_memory_cache:
+				idxs = list(range(start, end))
+				mels_bt_f = jnp.array(cache_val["mels"][idxs])
+				frame_cond = jnp.array(cache_val["conds"][idxs])
+				mask_bt = jnp.array(cache_val["masks"][idxs])
+			else:
+				batch = [val_dataset[i] for i in range(start, end)]
+				col = collate_vae_batch(batch)
+				phoneme_ids = jnp.array(col["phoneme_ids"])
+				mels_bt_f = jnp.array(col["mel_specs"])
+				durations = np.array(col["durations"])
+				mel_len = np.array(col["mel_lengths"])
+				enc_out = text_encoder(phoneme_ids, training=False)
+				enc_out_np = np.array(enc_out)
+				frame_cond_np, mask_np = build_frame_level_condition(enc_out_np, durations, mel_len)
+				factor = 2 ** down_stages
+				t_max = frame_cond_np.shape[1]
+				T = int(np.ceil(t_max / factor) * factor)
+				mels_bt_f_np = np.array(mels_bt_f)
+				if mels_bt_f_np.shape[2] < T:
+					pad = np.zeros((mels_bt_f_np.shape[0], mels_bt_f_np.shape[1], T - mels_bt_f_np.shape[2]), dtype=mels_bt_f_np.dtype)
+					mels_bt_f_np = np.concatenate([mels_bt_f_np, pad], axis=2)
+				elif mels_bt_f_np.shape[2] > T:
+					mels_bt_f_np = mels_bt_f_np[:, :, :T]
+				if frame_cond_np.shape[1] < T:
+					pad = np.zeros((frame_cond_np.shape[0], T - frame_cond_np.shape[1], frame_cond_np.shape[2]), dtype=frame_cond_np.dtype)
+					frame_cond_np = np.concatenate([frame_cond_np, pad], axis=1)
+				if mask_np.shape[1] < T:
+					padm = np.zeros((mask_np.shape[0], T - mask_np.shape[1]), dtype=mask_np.dtype)
+					mask_np = np.concatenate([mask_np, padm], axis=1)
+				frame_cond = jnp.array(frame_cond_np)
+				mask_bt = jnp.array(mask_np)
+				mels_bt_f = jnp.array(mels_bt_f_np)
 			
 			loss = model.test_on_batch(
 				x=(mels_bt_f, frame_cond, mask_bt),
@@ -332,6 +417,15 @@ def main():
 	parser.add_argument("--postnet_layers", type=int, default=4)
 	parser.add_argument("--postnet_channels", type=int, default=256)
 	parser.add_argument("--postnet_dropout", type=float, default=0.5)
+	parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"])
+	parser.add_argument("--momentum", type=float, default=0.9)
+	parser.add_argument("--nesterov", action="store_true")
+	parser.add_argument("--lr_schedule", type=str, default="cosine", choices=["none", "cosine", "exp"])
+	parser.add_argument("--warmup_steps", type=int, default=0)
+	parser.add_argument("--decay_alpha", type=float, default=0.1)
+	parser.add_argument("--decay_rate", type=float, default=0.96)
+	parser.add_argument("--in_memory_cache", action="store_true")
+	parser.add_argument("--target_len", type=int, default=1024)
 	args = parser.parse_args()
 	
 	train_postnet(
@@ -349,6 +443,15 @@ def main():
 		postnet_layers=args.postnet_layers,
 		postnet_channels=args.postnet_channels,
 		postnet_dropout=args.postnet_dropout,
+		optimizer_name=args.optimizer,
+		momentum=args.momentum,
+		nesterov=args.nesterov,
+		lr_schedule=args.lr_schedule,
+		warmup_steps=args.warmup_steps,
+		decay_alpha=args.decay_alpha,
+		decay_rate=args.decay_rate,
+		in_memory_cache=args.in_memory_cache,
+		target_len=args.target_len,
 	)
 
 

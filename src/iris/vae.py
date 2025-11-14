@@ -170,6 +170,8 @@ class APCoupling(layers.Layer):
 		super().__init__(name=name)
 		self.channels = channels
 		self.hidden_channels = hidden_channels
+		# Conditioning projection - MUST be stored as self.xxx
+		self.cond_proj = layers.Dense(channels // 2)
 		# translation network t(x1, cond)
 		self.net = keras.Sequential([
 			layers.Conv1D(filters=hidden_channels, kernel_size=3, padding="same"),
@@ -177,7 +179,7 @@ class APCoupling(layers.Layer):
 			layers.Activation("gelu"),
 			layers.Conv1D(filters=channels // 2, kernel_size=1, padding="same"),
 		])
-		# FiLM should modulate features with the same dimensionality as x1 (C/2)
+		# FiLM modulates the network output with conditioning
 		self.film = FiLM(channels // 2)
 	
 	def call(self, x, cond, reverse: bool = False):
@@ -189,14 +191,16 @@ class APCoupling(layers.Layer):
 		"""
 		c = x.shape[-1]
 		x1, x2 = ops.split(x, 2, axis=-1)
-		# Compute conditioning features for the net
-		# First embed cond into C/2 channels to match x1
-		cond_embed = layers.Dense(self.channels // 2)(cond)
+		# Project conditioning to match x1 channels
+		cond_embed = self.cond_proj(cond)
 		cond_embed = ops.gelu(cond_embed)
-		cond_embed = self.film(cond_embed, cond)
-		# Residual conv net takes x1 + cond_embed
+		# Residual: combine x1 with conditioning
 		h = x1 + cond_embed
+		# Run through translation network
 		t = self.net(h)
+		# Apply FiLM to translation output using conditioning
+		t = self.film(t, cond_embed)
+		# Apply coupling
 		if reverse:
 			y2 = x2 - t
 		else:
@@ -332,17 +336,6 @@ class TextConditionedVAE(keras.Model):
 		self.return_residual = True
 		self.residual_proj = layers.Dense(cond_dim)
 	
-	def _match_time_length(self, x, target_len):
-		"""Trim or pad time dimension to exactly target_len without conditional branches."""
-		b = ops.shape(x)[0]
-		t = ops.shape(x)[1]
-		c = ops.shape(x)[2]
-		keep = ops.minimum(t, target_len)
-		trimmed = x[:, :keep, :]
-		pad_len = target_len - keep  # always >= 0 since keep <= target_len
-		zeros = ops.zeros((b, pad_len, c), dtype=x.dtype)
-		return ops.concatenate([trimmed, zeros], axis=1)
-	
 	def reparameterize(self, mean, logvar, training=False):
 		if training:
 			eps = keras.random.normal(shape=ops.shape(mean), seed=self.seed_generator)
@@ -396,11 +389,15 @@ class TextConditionedVAE(keras.Model):
 		
 		# Decoder path
 		d = self.dec_in(z_flow)
+		# First apply decoder blocks at downsampled resolution with downsampled conditioning
 		for block in self.dec_blocks:
-			# Triple conditioning: decoder also uses frame-level cond but we need to upsample cond back to original T after upsampling
 			d = block(d, lat_cond, training=training)
-		# Upsample to frame rate
+		# Upsample to full frame rate
 		d_up = self.upsample(d)
+		
+		# NOTE: We assume input dimensions are pre-padded correctly in training
+		# so d_up and frame_text_cond should already match.
+		# The training script pads both mels and conditioning to the same target_len.
 		
 		d_up = self.dec_out_norm(d_up)
 		out = self.out_proj(d_up)  # [B, T, n_mels]
@@ -445,11 +442,17 @@ class TextConditionedVAE(keras.Model):
 			z_prior = keras.random.normal((b, tp, c), seed=self.seed_generator)
 		# Inverse flow
 		z = self.flow(z_prior, cond=lat_cond, reverse=True)
-		# Decode
+		# Decode at latent resolution
 		d = self.dec_in(z)
 		for block in self.dec_blocks:
 			d = block(d, lat_cond, training=False)
+		# Upsample to full frame rate
 		d_up = self.upsample(d)
+		
+		# NOTE: d_up should already match frame_text_cond time dimension
+		# since both go through same downsample/upsample factors.
+		# If mismatched, it indicates an issue with input padding.
+		
 		d_up = self.dec_out_norm(d_up)
 		out = self.out_proj(d_up)
 		recon = ops.transpose(out, (0, 2, 1))
