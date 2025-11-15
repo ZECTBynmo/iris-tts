@@ -148,15 +148,17 @@ def main():
         frame_cond_np = np.concatenate([frame_cond_np, pad], axis=1)
     frame_cond = jnp.array(frame_cond_np)
 
-    # VAE
+    # VAE (matching PortaSpeech architecture)
     vae = TextConditionedVAE(
         n_mels=args.n_mels,
         cond_dim=args.embed_dim,
-        model_channels=args.embed_dim,
-        num_wavenet_blocks=6,
+        model_channels=192,
+        latent_dim=16,
+        num_wavenet_blocks=8,
+        decoder_blocks=4,
         down_stages=args.down_stages,
         flow_layers=4,
-        flow_hidden=args.embed_dim,
+        flow_hidden=64,
     )
     _ = vae(
         mels_bt_f=jnp.ones((1, args.n_mels, 16), dtype="float32"),

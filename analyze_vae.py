@@ -37,6 +37,7 @@ def extract_mel_spectrogram(audio_path: str, n_mels: int = 80, sample_rate: int 
         n_mels=n_mels,
         fmin=0,
         fmax=8000,
+        power=1.0,  # Use magnitude, matching training data!
     )
     mel = np.log(np.clip(mel, a_min=1e-5, a_max=None))
     return mel, audio
@@ -65,16 +66,18 @@ def main():
     down_stages = 2
     sample_rate = 22050
     
-    # Load VAE
+    # Load VAE (matching PortaSpeech architecture)
     logger.info("\n[1/6] Loading VAE model...")
     vae = TextConditionedVAE(
         n_mels=n_mels,
         cond_dim=embed_dim,
-        model_channels=embed_dim,
-        num_wavenet_blocks=6,
+        model_channels=192,
+        latent_dim=16,
+        num_wavenet_blocks=8,
+        decoder_blocks=4,
         down_stages=down_stages,
         flow_layers=4,
-        flow_hidden=embed_dim,
+        flow_hidden=64,
     )
     
     # Build

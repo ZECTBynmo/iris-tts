@@ -92,7 +92,15 @@ class VAETrainer(keras.Model):
 		# Forward pass again to access posterior stats
 		recon, (mean, logvar), _ = self.vae(mels_bt_f, frame_text_cond, training=True)
 		loss_recon = self.vae.compute_recon_l1(y, recon, mask=mask_bt)
-		loss_kl = self.vae.compute_kl(mean, logvar)
+		
+		# Downsample mask to match latent space dimensions (mean/logvar are downsampled)
+		# mean/logvar: [B, T', C] where T' = T / (2^down_stages)
+		# mask_bt: [B, T] -> need to downsample to [B, T']
+		# Simple approach: take every Nth frame
+		factor = 2 ** 2  # down_stages
+		mask_downsampled = mask_bt[:, ::factor]
+		
+		loss_kl = self.vae.compute_kl(mean, logvar, mask=mask_downsampled)
 		# Note: Can't store losses here for logging because this runs in JIT context
 		# Will log total loss only
 		return loss_recon + self._kl_weight * loss_kl
@@ -133,13 +141,16 @@ def train_vae(
 		"n_mels": n_mels,
 		"embed_dim": embed_dim,
 		"model_channels": model_channels,
+		"latent_dim": 16,
 		"num_blocks": num_blocks,
+		"decoder_blocks": 4,
 		"down_stages": down_stages,
 		"flow_layers": flow_layers,
 		"flow_hidden": flow_hidden,
 		"batch_size": batch_size,
 		"num_epochs": num_epochs,
 		"learning_rate": learning_rate,
+		"gradient_clip_norm": 1.0,
 		"val_split": val_split,
 		"freeze_encoder": freeze_encoder,
 		"encoder_weights": encoder_weights,
@@ -195,13 +206,15 @@ def train_vae(
 	if freeze_encoder:
 		text_encoder.trainable = False
 	
-	# VAE model
+	# VAE model (matching PortaSpeech architecture)
 	logger.info("Building VAE...")
 	vae = TextConditionedVAE(
 		n_mels=n_mels,
 		cond_dim=embed_dim,
 		model_channels=model_channels,
+		latent_dim=16,  # PortaSpeech uses 16, not model_channels!
 		num_wavenet_blocks=num_blocks,
+		decoder_blocks=4,  # PortaSpeech uses fewer decoder blocks
 		down_stages=down_stages,
 		flow_layers=flow_layers,
 		flow_hidden=flow_hidden,
@@ -217,12 +230,16 @@ def train_vae(
 
 	# Training wrapper - start with annealed KL weight
 	model = VAETrainer(vae=vae, kl_weight=kl_anneal_start)
+	
+	# Use gradient clipping for stability (following PortaSpeech: clipnorm=1.0)
+	optimizer = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
+	
 	model.compile(
-		optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+		optimizer=optimizer,
 		loss=model.compute_loss,
 		jit_compile=True,
 	)
-	logger.info("Compiled VAE trainer with JIT.")
+	logger.info("Compiled VAE trainer with JIT and gradient clipping (clipnorm=1.0).")
 	logger.info(f"KL annealing: {kl_anneal_start:.4f} -> {kl_weight:.4f} over {kl_anneal_epochs} epochs")
 	
 	def compute_kl_weight_for_epoch(epoch_num):
@@ -388,11 +405,11 @@ def main():
 	parser.add_argument("--freeze_encoder", action="store_true")
 	parser.add_argument("--n_mels", type=int, default=80)
 	parser.add_argument("--embed_dim", type=int, default=256)
-	parser.add_argument("--model_channels", type=int, default=256)
-	parser.add_argument("--num_blocks", type=int, default=6)
+	parser.add_argument("--model_channels", type=int, default=192, help="Hidden channels (PortaSpeech: 192)")
+	parser.add_argument("--num_blocks", type=int, default=8, help="Encoder blocks (PortaSpeech: 8)")
 	parser.add_argument("--down_stages", type=int, default=2)
 	parser.add_argument("--flow_layers", type=int, default=4)
-	parser.add_argument("--flow_hidden", type=int, default=256)
+	parser.add_argument("--flow_hidden", type=int, default=64, help="Flow hidden (PortaSpeech: 64)")
 	parser.add_argument("--batch_size", type=int, default=8)
 	parser.add_argument("--num_epochs", type=int, default=50)
 	parser.add_argument("--learning_rate", type=float, default=2e-4)

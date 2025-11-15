@@ -618,9 +618,14 @@ class LJSpeechVAEDataset:
             n_mels=self.n_mels
         )
         
+        # CRITICAL: Trim mel to match duration sum (following PortaSpeech)
+        # MFA alignments only cover speech portion, not trailing silence
+        total_frames = int(sum(durations))
+        mel_spec = mel_spec[:, :total_frames]
+        
         return {
             'phoneme_ids': phoneme_ids,
-            'mel_spec': mel_spec,  # [n_mels, time]
+            'mel_spec': mel_spec,  # [n_mels, time] - trimmed to match durations
             'durations': durations,
             'text': text,
             'file_id': sample_id,

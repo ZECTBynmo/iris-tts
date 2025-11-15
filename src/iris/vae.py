@@ -49,7 +49,7 @@ class WaveNetResBlock(layers.Layer):
 			padding="same",
 			dilation_rate=dilation_rate,
 		)
-		self.norm = layers.LayerNormalization(epsilon=1e-6)
+		# No LayerNorm - following PortaSpeech NonCausalWaveNet
 		self.film = FiLM(channels)
 		self.dropout = layers.Dropout(dropout)
 		self.res_proj = layers.Conv1D(filters=channels, kernel_size=1)
@@ -61,8 +61,7 @@ class WaveNetResBlock(layers.Layer):
 			cond: [B, T, Cc] (time-aligned conditioning)
 		"""
 		h = self.conv(x)
-		h = self.norm(h)
-		h = ops.gelu(h)
+		h = ops.gelu(h)  # Activation before FiLM
 		h = self.film(h, cond)
 		h = self.dropout(h, training=training)
 		return x + self.res_proj(h)
@@ -88,10 +87,9 @@ class TemporalDownsample(layers.Layer):
 		
 		self.blocks = []
 		for i in range(num_stages):
-			self.blocks.append([
-				layers.Conv1D(filters=channels, kernel_size=kernel_size, strides=2, padding="same"),
-				layers.LayerNormalization(epsilon=1e-6),
-			])
+			self.blocks.append(
+				layers.Conv1D(filters=channels, kernel_size=kernel_size, strides=2, padding="same")
+			)
 	
 	def call(self, x, training=False):
 		"""
@@ -101,9 +99,8 @@ class TemporalDownsample(layers.Layer):
 			h: [B, T / 2^S, channels]
 		"""
 		h = x
-		for conv, norm in self.blocks:
+		for conv in self.blocks:
 			h = conv(h)
-			h = norm(h)
 			h = ops.gelu(h)
 		return h
 	
@@ -130,10 +127,9 @@ class TemporalUpsample(layers.Layer):
 		
 		self.refine = []
 		for i in range(num_stages):
-			self.refine.append([
-				layers.Conv1D(filters=channels, kernel_size=kernel_size, padding="same"),
-				layers.LayerNormalization(epsilon=1e-6),
-			])
+			self.refine.append(
+				layers.Conv1D(filters=channels, kernel_size=kernel_size, padding="same")
+			)
 	
 	def _upsample2x(self, x):
 		# x: [B, T, C] -> [B, 2T, C] by repeat
@@ -144,10 +140,9 @@ class TemporalUpsample(layers.Layer):
 	
 	def call(self, x, training=False):
 		h = x
-		for conv, norm in self.refine:
+		for conv in self.refine:
 			h = self._upsample2x(h)
 			h = conv(h)
-			h = norm(h)
 			h = ops.gelu(h)
 		return h
 	
@@ -172,13 +167,15 @@ class APCoupling(layers.Layer):
 		self.hidden_channels = hidden_channels
 		# Conditioning projection - MUST be stored as self.xxx
 		self.cond_proj = layers.Dense(channels // 2)
-		# translation network t(x1, cond)
-		self.net = keras.Sequential([
-			layers.Conv1D(filters=hidden_channels, kernel_size=3, padding="same"),
-			layers.LayerNormalization(epsilon=1e-6),
-			layers.Activation("gelu"),
-			layers.Conv1D(filters=channels // 2, kernel_size=1, padding="same"),
-		])
+		# translation network t(x1, cond) - no LayerNorm (following PortaSpeech)
+		self.net_pre = layers.Conv1D(filters=hidden_channels, kernel_size=3, padding="same")
+		self.net_post = layers.Conv1D(
+			filters=channels // 2, 
+			kernel_size=1, 
+			padding="same",
+			kernel_initializer="zeros",  # PortaSpeech initializes to zero!
+			bias_initializer="zeros",
+		)
 		# FiLM modulates the network output with conditioning
 		self.film = FiLM(channels // 2)
 	
@@ -197,7 +194,9 @@ class APCoupling(layers.Layer):
 		# Residual: combine x1 with conditioning
 		h = x1 + cond_embed
 		# Run through translation network
-		t = self.net(h)
+		h = self.net_pre(h)
+		h = ops.gelu(h)
+		t = self.net_post(h)  # Zero-initialized for stability
 		# Apply FiLM to translation output using conditioning
 		t = self.film(t, cond_embed)
 		# Apply coupling
@@ -265,13 +264,14 @@ class TextConditionedVAE(keras.Model):
 		self,
 		n_mels: int,
 		cond_dim: int,
-		model_channels: int = 256,
-		num_wavenet_blocks: int = 6,
+		model_channels: int = 192,
+		latent_dim: int = 16,
+		num_wavenet_blocks: int = 8,
+		decoder_blocks: int = 4,
 		wavenet_kernel_size: int = 5,
 		down_stages: int = 2,
 		flow_layers: int = 4,
-		flow_hidden: int = 256,
-		decoder_channels: Optional[int] = None,
+		flow_hidden: int = 64,
 		dropout: float = 0.1,
 		name: Optional[str] = None,
 	):
@@ -279,18 +279,20 @@ class TextConditionedVAE(keras.Model):
 		self.n_mels = n_mels
 		self.cond_dim = cond_dim
 		self.model_channels = model_channels
+		self.latent_dim = latent_dim
 		self.num_wavenet_blocks = num_wavenet_blocks
+		self.decoder_blocks = decoder_blocks
 		self.wavenet_kernel_size = wavenet_kernel_size
 		self.down_stages = down_stages
 		self.dropout_rate = dropout
 		
-		dec_channels = decoder_channels or model_channels
+		dec_channels = model_channels
 		
 		# RNG for JAX: use a SeedGenerator and pass it to random ops
 		self.seed_generator = keras.random.SeedGenerator(1337)
 		
 		# Input projection (mel -> model_channels)
-		self.in_norm = layers.LayerNormalization(epsilon=1e-6)
+		# No input normalization - process raw mels directly (following PortaSpeech)
 		self.in_proj = layers.Conv1D(filters=model_channels, kernel_size=1, padding="same")
 		
 		# WaveNet encoder blocks (pre-downsampling), each FiLM conditioned on frame-level text
@@ -309,15 +311,16 @@ class TextConditionedVAE(keras.Model):
 		self.downsample = TemporalDownsample(channels=model_channels, num_stages=down_stages, kernel_size=5, name="downsample")
 		self.down_cond_proj = layers.Conv1D(filters=model_channels, kernel_size=1, padding="same")
 		
-		# Posterior head
-		self.post_mean = layers.Conv1D(filters=model_channels, kernel_size=1, padding="same")
-		self.post_logvar = layers.Conv1D(filters=model_channels, kernel_size=1, padding="same")
+		# Latent projection (following PortaSpeech: encoder_decoder_hidden -> latent_hidden * 2)
+		self.latent_enc_proj = layers.Dense(latent_dim * 2)  # Outputs mean + logvar
 		
-		# Flow in latent space
-		self.flow = VolumePreservingFlow(channels=model_channels, num_layers=flow_layers, hidden_channels=flow_hidden, name="vpflow")
+		# Flow in latent space (operates on latent_dim, not model_channels!)
+		self.flow = VolumePreservingFlow(channels=latent_dim, num_layers=flow_layers, hidden_channels=flow_hidden, name="vpflow")
 		
-		# Decoder path
-		self.dec_in = layers.Conv1D(filters=dec_channels, kernel_size=1, padding="same")
+		# Decoder latent projection (latent_dim -> model_channels)
+		self.latent_dec_proj = layers.Dense(dec_channels)
+		
+		# Decoder path (fewer blocks than encoder, following PortaSpeech)
 		self.dec_blocks = [
 			WaveNetResBlock(
 				channels=dec_channels,
@@ -326,10 +329,11 @@ class TextConditionedVAE(keras.Model):
 				dropout=dropout,
 				name=f"dec_block_{i}",
 			)
-			for i in range(num_wavenet_blocks)
+			for i in range(decoder_blocks)
 		]
 		self.upsample = TemporalUpsample(channels=dec_channels, num_stages=down_stages, kernel_size=5, name="upsample")
-		self.dec_out_norm = layers.LayerNormalization(epsilon=1e-6)
+		# No normalization on output - let model learn natural mel range
+		# Following PortaSpeech: layer_norm=False on decoder output
 		self.out_proj = layers.Conv1D(filters=n_mels, kernel_size=1, padding="same")
 		
 		# Optional residual back to text encoder space: aggregate frame latents to phoneme-level outside this model if needed
@@ -367,9 +371,8 @@ class TextConditionedVAE(keras.Model):
 		# Convert mels to [B, T, n_mels]
 		mels = ops.transpose(mels_bt_f, (0, 2, 1))
 		
-		# Shared pre-processing
-		h = self.in_norm(mels)
-		h = self.in_proj(h)
+		# Direct projection - no input normalization (following PortaSpeech)
+		h = self.in_proj(mels)
 		
 		# WaveNet encoder with FiLM conditioning (frame-level)
 		for block in self.enc_blocks:
@@ -379,16 +382,16 @@ class TextConditionedVAE(keras.Model):
 		lat_cond = self._align_and_downsample_cond(frame_text_cond)  # [B, T', C]
 		lat_h = self.downsample(h)  # [B, T', C]
 		
-		# Posterior
-		mean = self.post_mean(lat_h)
-		logvar = self.post_logvar(lat_h)
+		# Project to latent space (following PortaSpeech: hidden -> latent_dim * 2)
+		latent_params = self.latent_enc_proj(lat_h)  # [B, T', latent_dim*2]
+		mean, logvar = ops.split(latent_params, 2, axis=-1)  # Each [B, T', latent_dim]
 		z = self.reparameterize(mean, logvar, training=training)
 		
 		# Flow forward during training, reverse during inference handled by separate method
 		z_flow = self.flow(z, cond=lat_cond, reverse=False)
 		
-		# Decoder path
-		d = self.dec_in(z_flow)
+		# Project latent back to hidden dimension (following PortaSpeech)
+		d = self.latent_dec_proj(z_flow)  # [B, T', dec_channels]
 		# First apply decoder blocks at downsampled resolution with downsampled conditioning
 		for block in self.dec_blocks:
 			d = block(d, lat_cond, training=training)
@@ -399,7 +402,7 @@ class TextConditionedVAE(keras.Model):
 		# so d_up and frame_text_cond should already match.
 		# The training script pads both mels and conditioning to the same target_len.
 		
-		d_up = self.dec_out_norm(d_up)
+		# Direct output projection - no normalization (following PortaSpeech)
 		out = self.out_proj(d_up)  # [B, T, n_mels]
 		recon = ops.transpose(out, (0, 2, 1))  # [B, n_mels, T]
 		
@@ -408,9 +411,15 @@ class TextConditionedVAE(keras.Model):
 		
 		return recon, (mean, logvar), residual
 	
-	def compute_kl(self, mean, logvar):
+	def compute_kl(self, mean, logvar, mask: Optional[jnp.ndarray] = None):
 		# KL between N(mean, exp(logvar)) and N(0, I), averaged over time and channels
 		kl = -0.5 * (1 + logvar - ops.square(mean) - ops.exp(logvar))
+		
+		if mask is not None:
+			# mask: [B, T] -> expand to channel dim
+			m = ops.expand_dims(mask, axis=-1)  # [B, T, 1]
+			kl = kl * m
+			return ops.sum(kl) / (ops.sum(m) + 1e-8)
 		return ops.mean(kl)
 	
 	def compute_recon_l1(self, target, recon, mask: Optional[jnp.ndarray] = None):
@@ -437,13 +446,13 @@ class TextConditionedVAE(keras.Model):
 		lat_cond = self._align_and_downsample_cond(frame_text_cond)
 		b = ops.shape(lat_cond)[0]
 		tp = ops.shape(lat_cond)[1]
-		c = self.model_channels
+		c = self.latent_dim  # Use latent_dim, not model_channels!
 		if z_prior is None:
 			z_prior = keras.random.normal((b, tp, c), seed=self.seed_generator)
 		# Inverse flow
 		z = self.flow(z_prior, cond=lat_cond, reverse=True)
-		# Decode at latent resolution
-		d = self.dec_in(z)
+		# Project latent to hidden dimension
+		d = self.latent_dec_proj(z)
 		for block in self.dec_blocks:
 			d = block(d, lat_cond, training=False)
 		# Upsample to full frame rate
@@ -453,7 +462,7 @@ class TextConditionedVAE(keras.Model):
 		# since both go through same downsample/upsample factors.
 		# If mismatched, it indicates an issue with input padding.
 		
-		d_up = self.dec_out_norm(d_up)
+		# Direct output projection - no normalization (following PortaSpeech)
 		out = self.out_proj(d_up)
 		recon = ops.transpose(out, (0, 2, 1))
 		residual = self.residual_proj(d_up) if self.return_residual else None
@@ -465,7 +474,9 @@ class TextConditionedVAE(keras.Model):
 			"n_mels": self.n_mels,
 			"cond_dim": self.cond_dim,
 			"model_channels": self.model_channels,
+			"latent_dim": self.latent_dim,
 			"num_wavenet_blocks": self.num_wavenet_blocks,
+			"decoder_blocks": self.decoder_blocks,
 			"wavenet_kernel_size": self.wavenet_kernel_size,
 			"down_stages": self.down_stages,
 			"dropout": self.dropout_rate,
