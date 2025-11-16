@@ -112,20 +112,25 @@ def train_postnet(
 			cfg = json.load(f)
 		n_mels = cfg.get("n_mels", 80)
 		embed_dim = cfg.get("embed_dim", 256)
-		model_channels = cfg.get("model_channels", 256)
-		num_blocks = cfg.get("num_blocks", 6)
+		model_channels = cfg.get("model_channels", 192)
+		latent_dim = cfg.get("latent_dim", 16)
+		num_blocks = cfg.get("num_blocks", 8)
+		decoder_blocks = cfg.get("decoder_blocks", 4)
 		down_stages = cfg.get("down_stages", 2)
 		flow_layers = cfg.get("flow_layers", 4)
-		flow_hidden = cfg.get("flow_hidden", 256)
+		flow_hidden = cfg.get("flow_hidden", 64)
+		logger.info(f"Loaded VAE config from {cfg_path}")
 	else:
-		logger.warning(f"No VAE config found at {cfg_path}, using defaults.")
+		logger.warning(f"No VAE config found at {cfg_path}, using PortaSpeech defaults.")
 		n_mels = 80
 		embed_dim = 256
-		model_channels = 256
-		num_blocks = 6
+		model_channels = 192
+		latent_dim = 16
+		num_blocks = 8
+		decoder_blocks = 4
 		down_stages = 2
 		flow_layers = 4
-		flow_hidden = 256
+		flow_hidden = 64
 	
 	# Datasets
 	logger.info("Loading datasets...")
@@ -134,6 +139,7 @@ def train_postnet(
 		alignments_dir=alignments_dir,
 		split="train",
 		val_split=val_split,
+		cache_dir=str(output_dir / "cache"),
 	)
 	val_dataset = LJSpeechVAEDataset(
 		ljspeech_dir=ljspeech_dir,
@@ -159,13 +165,15 @@ def train_postnet(
 	text_encoder.load_weights(encoder_weights)
 	text_encoder.trainable = False
 	
-	# VAE
+	# VAE (matching PortaSpeech architecture)
 	logger.info("Building VAE and loading core weights...")
 	vae = TextConditionedVAE(
 		n_mels=n_mels,
 		cond_dim=embed_dim,
 		model_channels=model_channels,
+		latent_dim=latent_dim,
 		num_wavenet_blocks=num_blocks,
+		decoder_blocks=decoder_blocks,
 		down_stages=down_stages,
 		flow_layers=flow_layers,
 		flow_hidden=flow_hidden,
@@ -228,7 +236,8 @@ def train_postnet(
 		channels=postnet_channels,
 		dropout=postnet_dropout,
 	)
-	_ = postnet(jnp.ones((1, n_mels, 16), dtype="float32"), training=False)
+	# Build with training=True to initialize BatchNorm moving stats
+	_ = postnet(jnp.ones((1, n_mels, 256), dtype="float32"), training=True)
 	logger.info(f"PostNet parameters: {postnet.count_params():,}")
 	
 	# Trainer

@@ -93,12 +93,12 @@ class VAETrainer(keras.Model):
 		recon, (mean, logvar), _ = self.vae(mels_bt_f, frame_text_cond, training=True)
 		loss_recon = self.vae.compute_recon_l1(y, recon, mask=mask_bt)
 		
-		# Downsample mask to match latent space dimensions (mean/logvar are downsampled)
-		# mean/logvar: [B, T', C] where T' = T / (2^down_stages)
+		# Downsample mask to match latent space dimensions (mean/logvar are downsampled).
+		# mean/logvar: [B, T', C] where T' = T / down_factor
 		# mask_bt: [B, T] -> need to downsample to [B, T']
-		# Simple approach: take every Nth frame
-		factor = 2 ** 2  # down_stages
-		mask_downsampled = mask_bt[:, ::factor]
+		# Use the actual downsample factor from the VAE to stay in sync with the model.
+		down_factor = self.vae.downsample.get_downsample_factor()
+		mask_downsampled = mask_bt[:, :: down_factor]
 		
 		loss_kl = self.vae.compute_kl(mean, logvar, mask=mask_downsampled)
 		# Note: Can't store losses here for logging because this runs in JIT context
@@ -112,6 +112,7 @@ def train_vae(
 	output_dir: str,
 	encoder_weights: Optional[str] = None,
 	freeze_encoder: bool = True,
+	resume_epoch: int = 0,
 	n_mels: int = 80,
 	embed_dim: int = 256,
 	model_channels: int = 256,
@@ -121,13 +122,13 @@ def train_vae(
 	flow_hidden: int = 256,
 	batch_size: int = 8,
 	num_epochs: int = 50,
-	learning_rate: float = 2e-4,
+	learning_rate: float = 4e-4,
 	val_split: float = 0.05,
 	checkpoint_dir: str = "checkpoints_vae",
 	log_interval: int = 100,
-	kl_weight: float = 0.1,
-	kl_anneal_start: float = 0.01,
-	kl_anneal_epochs: int = 10,
+	kl_weight: float = 0.01,
+	kl_anneal_start: float = 0.001,
+	kl_anneal_epochs: int = 20,
 ):
 	output_dir = Path(output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
@@ -227,9 +228,32 @@ def train_vae(
 	)
 	
 	logger.info(f"VAE parameters: {vae.count_params():,}")
+	
+	# Define KL weight schedule function
+	def compute_kl_weight_for_epoch(epoch_num):
+		"""Linear KL annealing schedule."""
+		if epoch_num >= kl_anneal_epochs:
+			return kl_weight
+		# Linear interpolation from kl_anneal_start to kl_weight
+		progress = epoch_num / kl_anneal_epochs
+		return kl_anneal_start + (kl_weight - kl_anneal_start) * progress
+	
+	# Resume from checkpoint if specified
+	if resume_epoch > 0:
+		resume_path = ckpt_dir / f"vae_core_epoch_{resume_epoch}.weights.h5"
+		if not resume_path.exists():
+			resume_path = ckpt_dir / "vae_core_best.weights.h5"
+		
+		if resume_path.exists():
+			logger.info(f"Resuming from epoch {resume_epoch}, loading: {resume_path}")
+			vae.load_weights(str(resume_path))
+		else:
+			logger.warning(f"Resume checkpoint not found at {resume_path}, starting from scratch")
+			resume_epoch = 0
 
-	# Training wrapper - start with annealed KL weight
-	model = VAETrainer(vae=vae, kl_weight=kl_anneal_start)
+	# Training wrapper - start with annealed KL weight (or resume weight)
+	initial_kl = compute_kl_weight_for_epoch(resume_epoch) if resume_epoch > 0 else kl_anneal_start
+	model = VAETrainer(vae=vae, kl_weight=initial_kl)
 	
 	# Use gradient clipping for stability (following PortaSpeech: clipnorm=1.0)
 	optimizer = keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
@@ -240,15 +264,106 @@ def train_vae(
 		jit_compile=True,
 	)
 	logger.info("Compiled VAE trainer with JIT and gradient clipping (clipnorm=1.0).")
+	if resume_epoch > 0:
+		logger.info(f"Resuming from epoch {resume_epoch} with KL weight {initial_kl:.4f}")
 	logger.info(f"KL annealing: {kl_anneal_start:.4f} -> {kl_weight:.4f} over {kl_anneal_epochs} epochs")
 	
-	def compute_kl_weight_for_epoch(epoch_num):
-		"""Linear KL annealing schedule."""
-		if epoch_num >= kl_anneal_epochs:
-			return kl_weight
-		# Linear interpolation from kl_anneal_start to kl_weight
-		progress = epoch_num / kl_anneal_epochs
-		return kl_anneal_start + (kl_weight - kl_anneal_start) * progress
+	# ------------------------------------------------------------------
+	# One-off debug pass on a single batch to inspect loss components.
+	# This mirrors the logic in debug_vae_loss.py so we can confirm that
+	# reconstruction, KL, and total loss are in a sane range before the
+	# main training loop.
+	# ------------------------------------------------------------------
+	try:
+		debug_batch = [train_dataset[i] for i in range(min(batch_size, len(train_dataset)))]
+		col_dbg = collate_vae_batch(debug_batch)
+		
+		phoneme_ids_dbg = jnp.array(col_dbg["phoneme_ids"])
+		mels_bt_f_dbg = jnp.array(col_dbg["mel_specs"])
+		durations_dbg = np.array(col_dbg["durations"])
+		mel_len_dbg = np.array(col_dbg["mel_lengths"])
+		
+		enc_out_dbg = text_encoder(phoneme_ids_dbg, training=False)
+		enc_out_dbg_np = np.array(enc_out_dbg)
+		frame_cond_dbg_np, mask_dbg_np = build_frame_level_condition(enc_out_dbg_np, durations_dbg, mel_len_dbg)
+		
+		# Pad to multiple of downsample factor, same as training loop
+		factor_dbg = 2 ** down_stages
+		t_max_dbg = frame_cond_dbg_np.shape[1]
+		target_len_dbg = int(np.ceil(t_max_dbg / factor_dbg) * factor_dbg)
+		
+		mels_bt_f_dbg_np = np.array(mels_bt_f_dbg)
+		if mels_bt_f_dbg_np.shape[2] < target_len_dbg:
+			pad = np.zeros(
+				(mels_bt_f_dbg_np.shape[0], mels_bt_f_dbg_np.shape[1], target_len_dbg - mels_bt_f_dbg_np.shape[2]),
+				dtype=mels_bt_f_dbg_np.dtype,
+			)
+			mels_bt_f_dbg_np = np.concatenate([mels_bt_f_dbg_np, pad], axis=2)
+		elif mels_bt_f_dbg_np.shape[2] > target_len_dbg:
+			mels_bt_f_dbg_np = mels_bt_f_dbg_np[:, :, :target_len_dbg]
+		
+		if frame_cond_dbg_np.shape[1] < target_len_dbg:
+			pad = np.zeros(
+				(frame_cond_dbg_np.shape[0], target_len_dbg - frame_cond_dbg_np.shape[1], frame_cond_dbg_np.shape[2]),
+				dtype=frame_cond_dbg_np.dtype,
+			)
+			frame_cond_dbg_np = np.concatenate([frame_cond_dbg_np, pad], axis=1)
+		if mask_dbg_np.shape[1] < target_len_dbg:
+			padm = np.zeros(
+				(mask_dbg_np.shape[0], target_len_dbg - mask_dbg_np.shape[1]),
+				dtype=mask_dbg_np.dtype,
+			)
+			mask_dbg_np = np.concatenate([mask_dbg_np, padm], axis=1)
+		
+		frame_cond_dbg = jnp.array(frame_cond_dbg_np)
+		mask_bt_dbg = jnp.array(mask_dbg_np)
+		mels_bt_f_dbg = jnp.array(mels_bt_f_dbg_np)
+		
+		# Basic input stats
+		logger.info(
+			f"[DEBUG] Input mel stats | "
+			f"range=[{float(ops.min(mels_bt_f_dbg)):.3f}, {float(ops.max(mels_bt_f_dbg)):.3f}], "
+			f"mean={float(ops.mean(mels_bt_f_dbg)):.3f}, "
+			f"std={float(ops.std(mels_bt_f_dbg)):.3f}"
+		)
+		
+		# Forward through VAE
+		recon_dbg, (mean_dbg, logvar_dbg), _ = vae(mels_bt_f_dbg, frame_cond_dbg, training=True)
+		
+		# Recon stats
+		logger.info(
+			f"[DEBUG] Recon mel stats | "
+			f"range=[{float(ops.min(recon_dbg)):.3f}, {float(ops.max(recon_dbg)):.3f}], "
+			f"mean={float(ops.mean(recon_dbg)):.3f}, "
+			f"std={float(ops.std(recon_dbg)):.3f}"
+		)
+		
+		# Latent stats
+		logger.info(
+			f"[DEBUG] Latent stats | "
+			f"mean_range=[{float(ops.min(mean_dbg)):.3f}, {float(ops.max(mean_dbg)):.3f}], "
+			f"logvar_range=[{float(ops.min(logvar_dbg)):.3f}, {float(ops.max(logvar_dbg)):.3f}]"
+		)
+		
+		# Reconstruction loss
+		loss_recon_dbg = vae.compute_recon_l1(mels_bt_f_dbg, recon_dbg, mask=mask_bt_dbg)
+		
+		# KL loss (using same downsample factor logic as main training)
+		down_factor_dbg = vae.downsample.get_downsample_factor()
+		mask_down_dbg = mask_bt_dbg[:, :: down_factor_dbg]
+		loss_kl_dbg = vae.compute_kl(mean_dbg, logvar_dbg, mask=mask_down_dbg)
+		
+		total_dbg = loss_recon_dbg + initial_kl * loss_kl_dbg
+		
+		logger.info(
+			f"[DEBUG] Single-batch loss breakdown | "
+			f"recon={float(loss_recon_dbg):.6f}, "
+			f"kl={float(loss_kl_dbg):.6f}, "
+			f"kl_weight={initial_kl:.6f}, "
+			f"total={float(total_dbg):.6f}"
+		)
+	except Exception as e:
+		logger.warning(f"[DEBUG] Failed single-batch loss breakdown: {e}")
 	
 	def iterate_batches(dataset, bs):
 		num_batches = int(np.ceil(len(dataset) / bs))
@@ -260,7 +375,7 @@ def train_vae(
 	best_val = float("inf")
 	global_step = 0
 	
-	for epoch in range(num_epochs):
+	for epoch in range(resume_epoch, num_epochs):
 		# Update KL weight for this epoch
 		current_kl_weight = compute_kl_weight_for_epoch(epoch)
 		model.set_kl_weight(current_kl_weight)
@@ -388,6 +503,7 @@ def train_vae(
 		
 		if (epoch + 1) % 5 == 0:
 			model.save_weights(ckpt_dir / f"vae_epoch_{epoch+1}.weights.h5")
+			vae.save_weights(ckpt_dir / f"vae_core_epoch_{epoch+1}.weights.h5")
 			logger.info(f"Saved periodic checkpoint at epoch {epoch+1}")
 	
 	# Final save
@@ -403,6 +519,7 @@ def main():
 	parser.add_argument("--output_dir", type=str, default="outputs/vae")
 	parser.add_argument("--encoder_weights", type=str, default="outputs/encoder/checkpoints/encoder_best.weights.h5")
 	parser.add_argument("--freeze_encoder", action="store_true")
+	parser.add_argument("--resume_epoch", type=int, default=0, help="Resume training from this epoch (0 = start fresh)")
 	parser.add_argument("--n_mels", type=int, default=80)
 	parser.add_argument("--embed_dim", type=int, default=256)
 	parser.add_argument("--model_channels", type=int, default=192, help="Hidden channels (PortaSpeech: 192)")
@@ -412,11 +529,11 @@ def main():
 	parser.add_argument("--flow_hidden", type=int, default=64, help="Flow hidden (PortaSpeech: 64)")
 	parser.add_argument("--batch_size", type=int, default=8)
 	parser.add_argument("--num_epochs", type=int, default=50)
-	parser.add_argument("--learning_rate", type=float, default=2e-4)
+	parser.add_argument("--learning_rate", type=float, default=4e-4)
 	parser.add_argument("--val_split", type=float, default=0.05)
-	parser.add_argument("--kl_weight", type=float, default=0.1, help="Target KL divergence weight after annealing")
-	parser.add_argument("--kl_anneal_start", type=float, default=0.01, help="Initial KL weight at start of training")
-	parser.add_argument("--kl_anneal_epochs", type=int, default=10, help="Number of epochs to anneal KL weight from start to target")
+	parser.add_argument("--kl_weight", type=float, default=0.01, help="Target KL divergence weight after annealing")
+	parser.add_argument("--kl_anneal_start", type=float, default=0.001, help="Initial KL weight at start of training")
+	parser.add_argument("--kl_anneal_epochs", type=int, default=20, help="Number of epochs to anneal KL weight from start to target")
 	parser.add_argument("--log_interval", type=int, default=100)
 	args = parser.parse_args()
 	
@@ -426,6 +543,7 @@ def main():
 		output_dir=args.output_dir,
 		encoder_weights=args.encoder_weights if args.encoder_weights else None,
 		freeze_encoder=args.freeze_encoder,
+		resume_epoch=args.resume_epoch,
 		n_mels=args.n_mels,
 		embed_dim=args.embed_dim,
 		model_channels=args.model_channels,

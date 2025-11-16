@@ -311,8 +311,18 @@ class TextConditionedVAE(keras.Model):
 		self.downsample = TemporalDownsample(channels=model_channels, num_stages=down_stages, kernel_size=5, name="downsample")
 		self.down_cond_proj = layers.Conv1D(filters=model_channels, kernel_size=1, padding="same")
 		
-		# Latent projection (following PortaSpeech: encoder_decoder_hidden -> latent_hidden * 2)
-		self.latent_enc_proj = layers.Dense(latent_dim * 2)  # Outputs mean + logvar
+		# Latent projections (following PortaSpeech: encoder_decoder_hidden -> latent_hidden * 2)
+		# Use separate heads so we can control log-variance initialization.
+		self.latent_mean_proj = layers.Dense(
+			latent_dim,
+			name="latent_mean_proj",
+		)
+		self.latent_logvar_proj = layers.Dense(
+			latent_dim,
+			kernel_initializer="zeros",
+			bias_initializer="zeros",
+			name="latent_logvar_proj",
+		)
 		
 		# Flow in latent space (operates on latent_dim, not model_channels!)
 		self.flow = VolumePreservingFlow(channels=latent_dim, num_layers=flow_layers, hidden_channels=flow_hidden, name="vpflow")
@@ -382,9 +392,9 @@ class TextConditionedVAE(keras.Model):
 		lat_cond = self._align_and_downsample_cond(frame_text_cond)  # [B, T', C]
 		lat_h = self.downsample(h)  # [B, T', C]
 		
-		# Project to latent space (following PortaSpeech: hidden -> latent_dim * 2)
-		latent_params = self.latent_enc_proj(lat_h)  # [B, T', latent_dim*2]
-		mean, logvar = ops.split(latent_params, 2, axis=-1)  # Each [B, T', latent_dim]
+		# Project to latent space with separate mean / logvar heads.
+		mean = self.latent_mean_proj(lat_h)      # [B, T', latent_dim]
+		logvar = self.latent_logvar_proj(lat_h)  # [B, T', latent_dim], starts near 0
 		z = self.reparameterize(mean, logvar, training=training)
 		
 		# Flow forward during training, reverse during inference handled by separate method
@@ -412,14 +422,17 @@ class TextConditionedVAE(keras.Model):
 		return recon, (mean, logvar), residual
 	
 	def compute_kl(self, mean, logvar, mask: Optional[jnp.ndarray] = None):
-		# KL between N(mean, exp(logvar)) and N(0, I), averaged over time and channels
+		# KL between N(mean, exp(logvar)) and N(0, I).
+		# Keep the definition aligned with debug_vae_loss.py so that
+		# per-batch inspected losses match training losses.
 		kl = -0.5 * (1 + logvar - ops.square(mean) - ops.exp(logvar))
 		
 		if mask is not None:
-			# mask: [B, T] -> expand to channel dim
+			# mask: [B, T] -> expand to latent dim
 			m = ops.expand_dims(mask, axis=-1)  # [B, T, 1]
-			kl = kl * m
-			return ops.sum(kl) / (ops.sum(m) + 1e-8)
+			kl_masked = kl * m
+			denom = ops.sum(m) + 1e-8
+			return ops.sum(kl_masked) / denom
 		return ops.mean(kl)
 	
 	def compute_recon_l1(self, target, recon, mask: Optional[jnp.ndarray] = None):

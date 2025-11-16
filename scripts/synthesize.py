@@ -15,6 +15,7 @@ from iris.text import create_text_processor
 from iris.encoder import PhonemeEncoder, DurationPredictor
 from iris.vae import TextConditionedVAE
 from iris.postnet import PostNet
+from iris.hifigan_pretrained import get_pretrained_hifigan
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -44,16 +45,6 @@ def predict_durations(encoder_out: jnp.ndarray, duration_head: DurationPredictor
     return frames.astype(jnp.int32)  # [B, P]
 
 
-def load_vocoder(entry: str):
-    """Dynamically load a vocoder inference function: 'module:function'."""
-    if ":" not in entry:
-        raise ValueError("vocoder_entry must be 'module:function'")
-    mod_name, fn_name = entry.split(":")
-    mod = importlib.import_module(mod_name)
-    fn = getattr(mod, fn_name)
-    return fn
-
-
 def length_regulate_np(encoder_out_np: np.ndarray, durations_np: np.ndarray) -> np.ndarray:
     """Expand phoneme-level encoder outputs to frame-level using numpy.
 
@@ -68,21 +59,6 @@ def length_regulate_np(encoder_out_np: np.ndarray, durations_np: np.ndarray) -> 
     durs = np.maximum(durs, 1)
     expanded = np.repeat(enc, durs, axis=0)  # [T, E]
     return expanded[None, ...]
-
-
-def mel_to_audio_griffinlim(mel_bt_f: np.ndarray, sample_rate: int, n_fft: int, hop_length: int, win_length: int) -> np.ndarray:
-    """Fallback vocoder via Griffin-Lim using librosa.
-
-    Note: our mels are log-magnitude, so we exponentiate back to linear before inversion.
-    """
-    import librosa
-    import librosa.feature
-    # mel_bt_f: [B, n_mels, T]
-    m_log = mel_bt_f[0]                 # log-mel
-    m_lin = np.exp(m_log).astype(float) # linear mel
-    S = librosa.feature.inverse.mel_to_stft(m_lin, sr=sample_rate, n_fft=n_fft)
-    y = librosa.griffinlim(S, n_iter=60, hop_length=hop_length, win_length=win_length)
-    return y.astype(np.float32)
 
 
 def main():
@@ -100,11 +76,8 @@ def main():
     parser.add_argument("--target_len", type=int, default=1024)
     parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--hop_length", type=int, default=256)
-    parser.add_argument("--vocoder", type=str, default="hifigan", choices=["hifigan", "griffinlim"])
-    parser.add_argument("--vocoder_entry", type=str, default="")
+    parser.add_argument("--use_griffin_lim", action="store_true", help="Use Griffin-Lim instead of HiFiGAN")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--n_fft", type=int, default=1024)
-    parser.add_argument("--win_length", type=int, default=1024)
     args = parser.parse_args()
 
     # RNG seed for VAE
@@ -172,29 +145,64 @@ def main():
     mel_bt_f, residual = vae.generate(frame_cond)  # [1, n_mels, T]
 
     # Optional PostNet
-    if Path(args.postnet_weights).exists():
-        logger.info(f"Loading PostNet: {Path(args.postnet_weights).resolve()}")
-        postnet = PostNet(n_mels=args.n_mels)
-        _ = postnet(jnp.ones((1, args.n_mels, 16), dtype="float32"), training=False)
-        postnet.load_weights(args.postnet_weights)
+    postnet_path = Path(args.postnet_weights)
+    if postnet_path.exists() and postnet_path.stat().st_size > 1024:  # Check file exists and not empty
+        logger.info(f"Loading PostNet: {postnet_path.resolve()}")
+        # Create PostNet with same architecture as current training
+        postnet = PostNet(
+            n_mels=args.n_mels,
+            num_layers=3,      # Current training
+            channels=256,      # Current training
+            kernel_size=5,
+            dropout=0.3,       # Current training
+        )
+        # Build PostNet with realistic size and training=True to init all BatchNorm stats
+        mel_shape = mel_bt_f.shape
+        dummy_mel = jnp.ones((1, args.n_mels, mel_shape[2]), dtype="float32")
+        _ = postnet(dummy_mel, training=True)  # training=True initializes BatchNorm properly
+        # Load weights
+        postnet.load_weights(str(postnet_path))
+        # Apply refinement
         mel_bt_f = postnet(mel_bt_f, training=False)
+        logger.info("✓ PostNet refinement applied")
+    else:
+        logger.info("No valid PostNet weights found, using VAE output directly")
 
     mel_bt_f_np = np.array(mel_bt_f)
 
     # Vocoder
-    if args.vocoder == "hifigan":
-        if not args.vocoder_entry:
-            raise ValueError("Provide --vocoder_entry as 'module:function' that maps mel->[waveform np.ndarray].")
-        infer_fn = load_vocoder(args.vocoder_entry)
-        # The function should accept (mel, sample_rate, hop_length) or just (mel); we try several signatures.
-        try:
-            audio = infer_fn(mel_bt_f_np, args.sample_rate, args.hop_length)
-        except TypeError:
-            audio = infer_fn(mel_bt_f_np)
-        audio = np.asarray(audio, dtype=np.float32)
+    if args.use_griffin_lim:
+        logger.info("Using Griffin-Lim vocoder...")
+        # Griffin-Lim expects linear magnitude mel
+        m_log = mel_bt_f_np[0]  # [n_mels, T]
+        
+        # Clip extreme values before exp to prevent overflow
+        m_log_clipped = np.clip(m_log, -11.513, 2.0)  # Reasonable range for log mels
+        m_lin = np.exp(m_log_clipped).astype(float)
+        
+        import librosa
+        import librosa.feature
+        
+        # mel_to_stft needs power=1.0 since VAE was trained with magnitude
+        S = librosa.feature.inverse.mel_to_stft(
+            m_lin, 
+            sr=args.sample_rate, 
+            n_fft=1024,
+            power=1.0  # Match training (magnitude, not power)
+        )
+        audio = librosa.griffinlim(S, n_iter=60, hop_length=args.hop_length, win_length=1024)
+        audio = audio.astype(np.float32)
     else:
-        logger.info("Using Griffin-Lim fallback vocoder.")
-        audio = mel_to_audio_griffinlim(mel_bt_f_np, args.sample_rate, args.n_fft, args.hop_length, args.win_length)
+        logger.info("Using HiFiGAN vocoder...")
+        vocoder = get_pretrained_hifigan()
+        audio = vocoder(mel_bt_f_np)
+        audio = np.asarray(audio, dtype=np.float32)
+        
+        # Ensure audio is 1D
+        if audio.ndim > 1:
+            audio = audio.squeeze()
+    
+    logger.info(f"Generated audio: {audio.shape}, duration={len(audio)/args.sample_rate:.2f}s")
 
     # Save WAV
     out_path = Path(args.output_wav)
